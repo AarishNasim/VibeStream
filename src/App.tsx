@@ -249,29 +249,54 @@ function ShareModal({
   video, 
   onClose,
   profile,
-  conversations
+  conversations,
+  socket
 }: { 
   video: Video; 
   onClose: () => void;
   profile: Profile;
   conversations: any[];
+  socket: Socket | null;
 }) {
   const handleSend = async (user: any, conversationId: string) => {
     const finalMessage = `Check out this Vibe! 🎥\n${video.url}`;
+    const messageId = generateUUID();
     
     // Save to DB
-    await supabase.from('messages').insert({
+    const { error } = await supabase.from('messages').insert({
+      id: messageId,
       conversation_id: conversationId,
       sender_id: profile.id,
       receiver_id: user.id,
-      text: finalMessage
+      text: finalMessage,
+      status: 'sent'
     });
     
+    if (error) {
+      console.error('Error sharing video:', error);
+      return;
+    }
+
     // Update conversation timestamp
     await supabase.from('conversations').update({ 
       last_message_text: finalMessage, 
       last_message_timestamp: new Date().toISOString() 
     }).eq('id', conversationId);
+
+    // Emit via socket for real-time delivery
+    if (socket) {
+      socket.emit('send-message', {
+        id: messageId,
+        room: conversationId,
+        conversationId,
+        senderId: profile.id,
+        senderName: profile.handle,
+        receiverId: user.id,
+        text: finalMessage,
+        timestamp: Date.now(),
+        status: 'sent'
+      });
+    }
     
     alert(`Sent to @${user.name || user.username}!`);
     onClose();
@@ -349,12 +374,14 @@ export default function App() {
 
     socketRef.current.on('connect', () => {
       console.log('Connected to socket server');
-      // Auto-authenticate socket if profile has an ID
+      // Re-authenticate on every connect/reconnect to rejoin personal room
+      // Use localStorage as source of truth since this closure may have stale state
       const savedProfile = localStorage.getItem('vibechatProfile');
       if (savedProfile) {
         const parsed = JSON.parse(savedProfile);
         if (parsed?.id && parsed.handle !== GUEST_PROFILE.handle) {
           socketRef.current?.emit('authenticate', parsed.id);
+          console.log('Socket re-authenticated for user:', parsed.id);
         }
       }
     });
@@ -468,20 +495,21 @@ export default function App() {
       if (!socketRef.current) return;
       
       const handleGlobalMessage = (data: Message) => {
-        // Only show toast if chat isn't currently open AND message is from someone else
-        if (data.senderId !== profile.id) {
-          if (activeChatRef.current?.room !== data.conversationId) {
-            setToast({ show: true, text: `${data.senderName}: ${data.text}`, avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + data.senderName });
-            setTimeout(() => setToast(null), 3000);
-            
-            // Auto-mark as delivered since user is online
-            supabase.from('messages').update({ status: 'delivered' }).eq('id', data.id).then();
-            socketRef.current?.emit('message-status-update', { room: data.conversationId, messageId: data.id, status: 'delivered', senderId: data.senderId });
-          }
-        }
-        
-        // Fetch fresh conversations to update sidebar in real-time!
+        // Refresh sidebar for ALL global messages (sender and receiver)
         fetchConversations();
+
+        // Skip toast and delivered-marking for our own messages
+        if (data.senderId === profile.id) return;
+
+        // Show toast only if the chat with this conversation isn't currently open
+        if (activeChatRef.current?.room !== data.conversationId) {
+          setToast({ show: true, text: `${data.senderName}: ${data.text}`, avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + data.senderName });
+          setTimeout(() => setToast(null), 3000);
+          
+          // Auto-mark as delivered since user is online
+          supabase.from('messages').update({ status: 'delivered' }).eq('id', data.id).then();
+          socketRef.current?.emit('message-status-update', { room: data.conversationId, messageId: data.id, status: 'delivered', senderId: data.senderId });
+        }
       };
 
       const handleGlobalStatus = (data: any) => {
@@ -646,6 +674,13 @@ export default function App() {
                       onClick={() => {
                         // Optimistically mark as read locally
                         setConversations(prev => prev.map(c => c.id === chat.id ? { ...c, unread: false } : c));
+                        // Also mark in DB so fetchConversations won't re-mark as unread
+                        supabase.from('messages')
+                          .update({ status: 'delivered' })
+                          .eq('conversation_id', chat.id)
+                          .eq('receiver_id', profile.id)
+                          .eq('status', 'sent')
+                          .then();
                         setActiveChat({ room: chat.room, user: chat.user });
                       }}
                     >
@@ -802,6 +837,7 @@ export default function App() {
             onClose={() => setActiveShareVideo(null)}
             profile={profile}
             conversations={conversations}
+            socket={socketRef.current}
           />
         )}
       </AnimatePresence>
@@ -1579,7 +1615,7 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
         setMessages(data.map(m => ({
           id: m.id,
           senderId: m.sender_id,
-          senderName: m.sender_id === profile.id ? 'me' : user.name,
+          senderName: m.sender_id === profile.id ? 'me' : (user.name || user.username || 'User'),
           text: m.text,
           timestamp: new Date(m.created_at).getTime(),
           status: m.status,
@@ -1605,30 +1641,24 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
     socket.on('connect', joinRoom);
 
     const handleNewMessage = (data: Message) => {
-      // If we are the sender, we already have this message (inserted optimistically with UUID)
-      if (data.senderId === profile.id) {
-        setMessages(prev => {
-          const hasReal = prev.some(m => m.id === data.id);
-          if (hasReal) return prev;
-          
-          // Match any optimistic message by matching text content within 15 seconds
-          const optIndex = prev.findIndex(m => m.senderId === profile.id && m.text === data.text && Math.abs(m.timestamp - data.timestamp) < 15000);
-          if (optIndex !== -1) {
-            return prev.map((m, idx) => idx === optIndex ? data : m);
-          }
-          return [...prev, data];
-        });
-        return;
-      }
-
+      // Since server uses socket.to() (excludes sender), we only receive OTHER people's messages here.
+      // Simple dedup by ID to prevent any edge-case duplicates.
       setMessages(prev => {
         if (prev.find(m => m.id === data.id)) return prev;
         return [...prev, data];
       });
 
-      // Auto-mark as seen and notify sender
-      supabase.from('messages').update({ status: 'seen' }).eq('id', data.id).then();
-      socket.emit('message-status-update', { room: conversationId, messageId: data.id, status: 'seen', senderId: data.senderId });
+      // Auto-mark as seen with retry — the sender's DB write may not have completed yet
+      const markSeen = async (retries = 3) => {
+        const { error } = await supabase.from('messages').update({ status: 'seen' }).eq('id', data.id);
+        if (error && retries > 0) {
+          // Message may not exist in DB yet; retry after a short delay
+          setTimeout(() => markSeen(retries - 1), 500);
+        } else {
+          socket.emit('message-status-update', { room: conversationId, messageId: data.id, status: 'seen', senderId: data.senderId });
+        }
+      };
+      markSeen();
     };
 
     const handleStatusUpdated = ({ messageId, status }: { messageId: string, status: 'sent' | 'delivered' | 'seen' }) => {
@@ -1647,7 +1677,12 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
 
   useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      const el = scrollRef.current;
+      const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+      // Only auto-scroll if user is near the bottom (reading latest messages)
+      if (isNearBottom) {
+        el.scrollTop = el.scrollHeight;
+      }
     }
   }, [messages]);
 
@@ -1683,18 +1718,22 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
       status: 'sent'
     });
 
-    // Update conversation timestamp
+    if (error) {
+      // ROLLBACK: Remove the optimistic message and restore input
+      console.error("Error inserting message:", error);
+      setMessages(prev => prev.filter(m => m.id !== messageId));
+      setInputText(text);
+      return;
+    }
+
+    // Update conversation timestamp (only on success)
     await supabase.from('conversations').update({ 
       last_message_text: text, 
       last_message_timestamp: new Date().toISOString() 
     }).eq('id', conversationId);
 
-    if (!error) {
-      // Emit via socket with the room identifier
-      socket.emit('send-message', { ...newMessage, room: conversationId });
-    } else {
-      console.error("Error inserting message:", error);
-    }
+    // Emit via socket with the room identifier
+    socket.emit('send-message', { ...newMessage, room: conversationId });
   };
 
   return (
@@ -1756,7 +1795,7 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
           onChange={(e) => setInputText(e.target.value)}
           placeholder="Transmit a vibe..."
           className="flex-1 bg-bg-alt border border-gray-800 rounded-2xl px-6 py-4 outline-none focus:border-coral transition-all font-bold text-xs uppercase tracking-widest"
-          onKeyPress={(e) => e.key === 'Enter' && handleSend()}
+          onKeyDown={(e) => e.key === 'Enter' && handleSend()}
         />
         <motion.button
           whileHover={{ scale: 1.05 }}
