@@ -268,7 +268,7 @@ function ShareModal({
       conversation_id: conversationId,
       sender_id: profile.id,
       receiver_id: user.id,
-      text: finalMessage,
+      content: finalMessage,
       status: 'sent'
     });
     
@@ -1616,7 +1616,7 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
           id: m.id,
           senderId: m.sender_id,
           senderName: m.sender_id === profile.id ? 'me' : (user.name || user.username || 'User'),
-          text: m.text,
+          text: m.content,
           timestamp: new Date(m.created_at).getTime(),
           status: m.status,
           conversationId: m.conversation_id
@@ -1714,7 +1714,7 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
       conversation_id: conversationId,
       sender_id: profile.id,
       receiver_id: user.id,
-      text: text,
+      content: text,
       status: 'sent'
     });
 
