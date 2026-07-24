@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { motion, AnimatePresence } from 'motion/react';
 import { Home, Search, MessageCircle, User, Heart, MessageSquare, Share2, Music2, Sparkles, Upload, Volume2, VolumeX, Play, Pause, Sun, Moon, Check, CheckCheck } from 'lucide-react';
@@ -346,7 +346,6 @@ export default function App() {
   const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [otpCode, setOtpCode] = useState('');
   const [loginError, setLoginError] = useState('');
   const [authenticated, setAuthenticated] = useState(false);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
@@ -356,10 +355,22 @@ export default function App() {
   const [toast, setToast] = useState<{show: boolean, text: string, avatar?: string} | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const activeChatRef = useRef(activeChat);
+  const videosLoadedRef = useRef(false);
+  const fetchConvoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const authenticatedRef = useRef(authenticated);
+  const profileRef = useRef(profile);
 
   useEffect(() => {
     activeChatRef.current = activeChat;
   }, [activeChat]);
+
+  useEffect(() => {
+    authenticatedRef.current = authenticated;
+  }, [authenticated]);
+
+  useEffect(() => {
+    profileRef.current = profile;
+  }, [profile]);
 
   const [isLightMode, setIsLightMode] = useState(() => {
     return localStorage.getItem('vibechatTheme') === 'light';
@@ -470,10 +481,12 @@ export default function App() {
           shares: v.shares || 0
         }));
         setVideos(formattedVideos);
+        videosLoadedRef.current = true;
       }
     }
     
-    if (currentView === 'home') {
+    // Bug 7 fix: Only fetch videos once, not on every tab switch
+    if (currentView === 'home' && !videosLoadedRef.current) {
       fetchVideos();
     }
   }, [currentView]);
@@ -495,11 +508,12 @@ export default function App() {
       if (!socketRef.current) return;
       
       const handleGlobalMessage = (data: Message) => {
-        // Refresh sidebar for ALL global messages (sender and receiver)
-        fetchConversations();
+        // Bug 1 fix: Debounced refresh instead of hammering DB on every event
+        debouncedFetchConversations();
 
+        // Bug 11 fix: Use refs for stable state access in socket handlers
         // Skip toast and delivered-marking for our own messages
-        if (data.senderId === profile.id) return;
+        if (data.senderId === profileRef.current.id) return;
 
         // Show toast only if the chat with this conversation isn't currently open
         if (activeChatRef.current?.room !== data.conversationId) {
@@ -513,8 +527,8 @@ export default function App() {
       };
 
       const handleGlobalStatus = (data: any) => {
-        // Fetch fresh conversations to update read status and counts in real-time!
-        fetchConversations();
+        // Bug 1 fix: Debounced refresh
+        debouncedFetchConversations();
       };
       
       socketRef.current.on('global-new-message', handleGlobalMessage);
@@ -527,31 +541,34 @@ export default function App() {
     }
   }, [authenticated, profile.id]);
 
-  const fetchConversations = async () => {
-    if (authenticated && profile.id) {
+  const fetchConversations = useCallback(async () => {
+    // Bug 11 fix: Use refs for stable state access
+    const currentAuth = authenticatedRef.current;
+    const currentProfile = profileRef.current;
+    if (currentAuth && currentProfile.id) {
       // 1. Mark unread messages as delivered if we are online
       supabase.from('messages')
         .update({ status: 'delivered' })
-        .eq('receiver_id', profile.id)
+        .eq('receiver_id', currentProfile.id)
         .eq('status', 'sent')
         .then();
 
       // Get unread conversations count
       const { data: unreadData } = await supabase.from('messages')
         .select('conversation_id')
-        .eq('receiver_id', profile.id)
+        .eq('receiver_id', currentProfile.id)
         .neq('status', 'seen');
       const unreadConvoIds = new Set(unreadData?.map(m => m.conversation_id) || []);
 
       // 2. Fetch conversations
       const { data, error } = await supabase.from('conversations')
         .select('*, p1:users!participant1_id(id, username, avatar_url), p2:users!participant2_id(id, username, avatar_url)')
-        .or(`participant1_id.eq.${profile.id},participant2_id.eq.${profile.id}`)
+        .or(`participant1_id.eq.${currentProfile.id},participant2_id.eq.${currentProfile.id}`)
         .order('last_message_timestamp', { ascending: false });
         
       if (!error && data) {
         const convos = data.map((c: any) => {
-          const otherUser = c.participant1_id === profile.id ? c.p2 : c.p1;
+          const otherUser = c.participant1_id === currentProfile.id ? c.p2 : c.p1;
           return {
             id: c.id,
             room: c.id,
@@ -564,7 +581,15 @@ export default function App() {
         setConversations(convos);
       }
     }
-  };
+  }, []);
+
+  // Bug 1 fix: Debounced version — prevents hammering DB with 30+ queries on rapid messages
+  const debouncedFetchConversations = useCallback(() => {
+    if (fetchConvoTimerRef.current) clearTimeout(fetchConvoTimerRef.current);
+    fetchConvoTimerRef.current = setTimeout(() => {
+      fetchConversations();
+    }, 500);
+  }, [fetchConversations]);
 
   useEffect(() => {
     if (currentView === 'chat') {
@@ -1321,7 +1346,8 @@ function UploadView({ profile, onUploadComplete }: { profile: Profile, onUploadC
   );
 }
 
-function NavButton({ icon: Icon, active, onClick }: { icon: any, label: string, active: boolean, onClick: () => void }) {
+// Bug 2 fix: Memoize NavButton to prevent re-render on every parent state change
+const NavButton = React.memo(function NavButton({ icon: Icon, active, onClick }: { icon: any, label: string, active: boolean, onClick: () => void }) {
   return (
     <button
       onClick={onClick}
@@ -1336,9 +1362,10 @@ function NavButton({ icon: Icon, active, onClick }: { icon: any, label: string, 
       )}
     </button>
   );
-}
+});
 
-function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenComments?: (video: Video) => void; onShare?: (video: Video) => void; key?: React.Key }) {
+// Bug 2 fix: Memoize VideoPlayer to prevent re-render when parent state changes (toast, chat, etc.)
+const VideoPlayer = React.memo(function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenComments?: (video: Video) => void; onShare?: (video: Video) => void; key?: React.Key }) {
   const [liked, setLiked] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
   const [showMuteIndicator, setShowMuteIndicator] = useState(false);
@@ -1543,9 +1570,10 @@ function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenC
           <span className="text-[10px] md:text-[11px] font-black tracking-wider text-white drop-shadow-[0_1.5px_4px_rgba(0,0,0,0.7)] mt-0.5">Share</span>
         </div>
 
+        {/* Bug 5 fix: Only animate music icon when video is active/in viewport */}
         <motion.div
-          animate={{ rotate: 360 }}
-          transition={{ duration: 4, repeat: Infinity, ease: 'linear' }}
+          animate={isActive ? { rotate: 360 } : { rotate: 0 }}
+          transition={isActive ? { duration: 4, repeat: Infinity, ease: 'linear' } : { duration: 0 }}
           className="w-7.5 h-7.5 md:w-9 md:h-9 rounded-full p-1.5 bg-black/40 border border-white/20 shadow-lg shadow-black/50 overflow-hidden flex items-center justify-center drop-shadow-[0_2px_6px_rgba(0,0,0,0.6)] mt-1"
         >
           <Music2 className="w-full h-full text-white" />
@@ -1582,13 +1610,14 @@ function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenC
       </div>
     </div>
   );
-}
+});
 
 function ChatWindow({ conversationId, user, profile, onClose, socket }: { conversationId: string, user: any, profile: Profile, onClose: () => void, socket: Socket }) {
   const [inputText, setInputText] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [isConnected, setIsConnected] = useState(socket.connected);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const prevMsgCountRef = useRef(0);
 
   useEffect(() => {
     const handleConnect = () => setIsConnected(true);
@@ -1605,14 +1634,18 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
 
   useEffect(() => {
     // Fetch historical messages from Supabase
+    // Bug 9 fix: Limit to last 100 messages for performance
     const fetchHistory = async () => {
       const { data, error } = await supabase
         .from('messages')
         .select('*')
         .eq('conversation_id', conversationId)
-        .order('created_at', { ascending: true });
+        .order('created_at', { ascending: false })
+        .limit(100);
       if (!error && data) {
-        setMessages(data.map(m => ({
+        // Reverse to display oldest first after limiting
+        const reversed = data.reverse();
+        const mapped = reversed.map(m => ({
           id: m.id,
           senderId: m.sender_id,
           senderName: m.sender_id === profile.id ? 'me' : (user.name || user.username || 'User'),
@@ -1620,9 +1653,11 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
           timestamp: new Date(m.created_at).getTime(),
           status: m.status,
           conversationId: m.conversation_id
-        })));
+        }));
+        prevMsgCountRef.current = mapped.length;
+        setMessages(mapped);
 
-        const unreadIds = data.filter((m: any) => m.receiver_id === profile.id && m.status !== 'seen').map((m: any) => m.id);
+        const unreadIds = reversed.filter((m: any) => m.receiver_id === profile.id && m.status !== 'seen').map((m: any) => m.id);
         if (unreadIds.length > 0) {
           await supabase.from('messages').update({ status: 'seen' }).in('id', unreadIds);
           unreadIds.forEach((id: string) => {
@@ -1766,9 +1801,9 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
             <p className="font-black text-center uppercase tracking-[0.4em] text-xs">Vibe Encrypted</p>
           </div>
         )}
-        {messages.map((msg) => (
+        {messages.map((msg, index) => (
           <motion.div
-            initial={{ scale: 0.9, opacity: 0, x: msg.senderId === profile.id ? 20 : -20 }}
+            initial={index >= prevMsgCountRef.current ? { scale: 0.9, opacity: 0, x: msg.senderId === profile.id ? 20 : -20 } : false}
             animate={{ scale: 1, opacity: 1, x: 0 }}
             key={msg.id}
             className={`flex ${msg.senderId === profile.id ? 'justify-end' : 'justify-start'}`}

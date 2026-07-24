@@ -16,6 +16,7 @@
     @apply h-full overflow-hidden bg-bg-main;
     font-family: var(--font-sans);
     color: white;
+    -webkit-tap-highlight-color: transparent;
   }
 }
 
@@ -42,6 +43,44 @@
 
 .snap-start {
   scroll-snap-align: start;
+}
+
+/* GPU-promote scrollable containers for smooth 60fps scrolling */
+.gpu-scroll {
+  will-change: scroll-position;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* ======================================================
+   MOBILE PERFORMANCE: Disable expensive GPU effects
+   backdrop-blur is the #1 mobile performance killer.
+   On screens <= 768px, replace blur with solid opaque BGs.
+   ====================================================== */
+@media (max-width: 768px) {
+  /* Kill all backdrop-blur on mobile — replace with opaque backgrounds */
+  .backdrop-blur-2xl,
+  .backdrop-blur-xl,
+  .backdrop-blur-sm,
+  .backdrop-blur-md {
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+  }
+
+  /* Make nav bars fully opaque since blur is disabled */
+  nav {
+    background-color: rgba(17, 17, 17, 0.98) !important;
+  }
+
+  /* Reduce box-shadow complexity on mobile */
+  .shadow-2xl,
+  .shadow-xl {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+  }
+
+  /* Hide background blur video layers on mobile (Bug 4) */
+  .blur-3xl {
+    display: none !important;
+  }
 }
 
 /* Day/Night Theme Overrides */
@@ -88,4 +127,11 @@
 
 .light header span {
   color: #6b7280 !important;
+}
+
+/* Light mode: opaque nav on mobile too */
+@media (max-width: 768px) {
+  .light nav {
+    background-color: rgba(255, 255, 255, 0.98) !important;
+  }
 }
