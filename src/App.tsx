@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { motion, AnimatePresence } from 'motion/react';
-import { Home, Search, MessageCircle, User, Heart, MessageSquare, Share2, Music2, Sparkles, Upload, Volume2, VolumeX, Play, Pause, Sun, Moon, Check, CheckCheck } from 'lucide-react';
+import { Home, Search, MessageCircle, User, Heart, MessageSquare, Share2, Music2, Sparkles, Upload, Volume2, VolumeX, Play, Pause, Sun, Moon, Check, CheckCheck, MoreVertical, Edit3, Trash2, Bookmark, EyeOff, AlertTriangle, Copy } from 'lucide-react';
 import { AppView, Video, Conversation, Message, Profile, Comment } from './types.ts';
 import { supabase } from './lib/supabase';
 
@@ -33,42 +33,7 @@ const GUEST_PROFILE: Profile = {
 };
 
 
-// Mock Data
-const MOCK_VIDEOS: Video[] = [
-  {
-    id: '1',
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-girl-in-neon-light-33431-large.mp4',
-    user: { name: 'neon_vibes', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=neon' },
-    description: 'Neon nights ✨ #vibes #neon #nightlife',
-    likes: 1240,
-    comments: 45,
-    shares: 12
-  },
-  {
-    id: '2',
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-tree-with-yellow-flowers-1173-large.mp4',
-    user: { name: 'nature_lover', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=nature' },
-    description: 'Beautiful spring morning 🌸 #nature #spring #fresh',
-    likes: 890,
-    comments: 23,
-    shares: 5
-  },
-  {
-    id: '3',
-    url: 'https://assets.mixkit.co/videos/preview/mixkit-young-woman-with-light-up-glasses-in-the-dark-33423-large.mp4',
-    user: { name: 'techno_girl', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=tech' },
-    description: 'Looking into the future 🕶️ #ai #cyberpunk #tech',
-    likes: 3400,
-    comments: 156,
-    shares: 89
-  }
-];
 
-const MOCK_CHATS: Conversation[] = [
-  { id: 'global', user: { id: 'global', name: 'Faisal KaaBI', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=global' }, lastMessage: 'Welcome to the world!', unread: true },
-  { id: '1', user: { id: '1', name: 'Aarish', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=aarish' }, lastMessage: 'Bhai video check kar!', unread: false },
-  { id: '2', user: { id: '2', name: 'Himanshu', avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=sky' }, lastMessage: 'Let\'s collaborate soon.', unread: false }
-];
 
 const FILTERS = [
   { id: 'none', name: 'Original', class: '' },
@@ -249,29 +214,54 @@ function ShareModal({
   video, 
   onClose,
   profile,
-  conversations
+  conversations,
+  socket
 }: { 
   video: Video; 
   onClose: () => void;
   profile: Profile;
   conversations: any[];
+  socket: Socket | null;
 }) {
   const handleSend = async (user: any, conversationId: string) => {
     const finalMessage = `Check out this Vibe! 🎥\n${video.url}`;
+    const messageId = generateUUID();
     
     // Save to DB
-    await supabase.from('messages').insert({
+    const { error } = await supabase.from('messages').insert({
+      id: messageId,
       conversation_id: conversationId,
       sender_id: profile.id,
       receiver_id: user.id,
-      text: finalMessage
+      content: finalMessage,
+      status: 'sent'
     });
     
+    if (error) {
+      console.error('Error sharing video:', error);
+      return;
+    }
+
     // Update conversation timestamp
     await supabase.from('conversations').update({ 
       last_message_text: finalMessage, 
       last_message_timestamp: new Date().toISOString() 
     }).eq('id', conversationId);
+
+    // Emit via socket for real-time delivery
+    if (socket) {
+      socket.emit('send-message', {
+        id: messageId,
+        room: conversationId,
+        conversationId,
+        senderId: profile.id,
+        senderName: profile.handle,
+        receiverId: user.id,
+        text: finalMessage,
+        timestamp: Date.now(),
+        status: 'sent'
+      });
+    }
     
     alert(`Sent to @${user.name || user.username}!`);
     onClose();
@@ -312,7 +302,24 @@ function ShareModal({
 
 export default function App() {
   const [currentView, setCurrentView] = useState<AppView>('home');
-  const [videos, setVideos] = useState<Video[]>(MOCK_VIDEOS);
+  const [videos, setVideos] = useState<Video[]>([]);
+  const [isLoadingVideos, setIsLoadingVideos] = useState(true);
+  const [activeMenuVideo, setActiveMenuVideo] = useState<Video | null>(null);
+  const [hiddenVideoIds, setHiddenVideoIds] = useState<string[]>([]);
+  const [savedVideoIds, setSavedVideoIds] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('vibestream_saved_posts') || '[]');
+    } catch {
+      return [];
+    }
+  });
+  const [reportedVideoIds, setReportedVideoIds] = useState<string[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem('vibestream_reported_posts') || '[]');
+    } catch {
+      return [];
+    }
+  });
   const [activeChat, setActiveChat] = useState<{room: string, user: any} | null>(null);
   const [activeCommentVideo, setActiveCommentVideo] = useState<Video | null>(null);
   const [activeShareVideo, setActiveShareVideo] = useState<Video | null>(null);
@@ -321,7 +328,6 @@ export default function App() {
   const [isLoginOpen, setIsLoginOpen] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [otpCode, setOtpCode] = useState('');
   const [loginError, setLoginError] = useState('');
   const [authenticated, setAuthenticated] = useState(false);
   const [isProfileOpen, setIsProfileOpen] = useState(false);
@@ -331,10 +337,188 @@ export default function App() {
   const [toast, setToast] = useState<{show: boolean, text: string, avatar?: string} | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const activeChatRef = useRef(activeChat);
+  const videosLoadedRef = useRef(false);
+  const fetchConvoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const authenticatedRef = useRef(authenticated);
+  const profileRef = useRef(profile);
+
+  const visibleVideos = useMemo(() => {
+    return videos.filter(v => !hiddenVideoIds.includes(v.id) && !reportedVideoIds.includes(v.id));
+  }, [videos, hiddenVideoIds, reportedVideoIds]);
+
+  const handleLikeUpdate = useCallback((videoId: string, increment: number) => {
+    setVideos(prev => prev.map(v => v.id === videoId ? { ...v, likes: Math.max(0, v.likes + increment) } : v));
+  }, []);
+
+  const [isEditingPost, setIsEditingPost] = useState<Video | null>(null);
+  const [editCaptionText, setEditCaptionText] = useState('');
+
+  // 1. Edit Post Callback
+  const handleEditPostSave = useCallback(async () => {
+    if (!isEditingPost) return;
+    const oldCaption = isEditingPost.description;
+    const newCaption = editCaptionText.trim();
+    
+    // Optimistically update locally
+    setVideos(prev => prev.map(v => v.id === isEditingPost.id ? { ...v, description: newCaption } : v));
+    setIsEditingPost(null);
+
+    // Write to Supabase DB
+    const { error } = await supabase
+      .from('videos')
+      .update({ description: newCaption })
+      .eq('id', isEditingPost.id);
+
+    if (error) {
+      console.error("Error editing video description:", error);
+      // rollback on failure
+      setVideos(prev => prev.map(v => v.id === isEditingPost.id ? { ...v, description: oldCaption } : v));
+      alert("Failed to edit post description: " + error.message);
+    }
+  }, [isEditingPost, editCaptionText]);
+
+  // 2. Delete Post Callback (Helper to extract bucket filepath)
+  const getStoragePathFromUrl = (url: string): string => {
+    const parts = url.split('/public/videos/');
+    if (parts.length > 1) {
+      return decodeURIComponent(parts[1]);
+    }
+    return '';
+  };
+
+  const handleDeletePost = useCallback(async (video: Video) => {
+    if (!window.confirm("Are you sure you want to delete this vibe permanently? This action cannot be undone.")) return;
+
+    const oldVideos = [...videos];
+    
+    // Optimistically remove from state
+    setVideos(prev => prev.filter(v => v.id !== video.id));
+    setActiveMenuVideo(null);
+
+    try {
+      // 1. Delete associated media from Supabase storage
+      const storagePath = getStoragePathFromUrl(video.url);
+      if (storagePath) {
+        const { error: storageError } = await supabase.storage
+          .from('videos')
+          .remove([storagePath]);
+        if (storageError) {
+          console.warn("Storage deletion warning (file might not exist):", storageError);
+        }
+      }
+
+      // 2. Delete database record
+      const { error: dbError } = await supabase
+        .from('videos')
+        .delete()
+        .eq('id', video.id);
+
+      if (dbError) throw dbError;
+      
+      alert("Vibe deleted successfully!");
+    } catch (err: any) {
+      console.error("Error deleting post:", err);
+      // Rollback on failure
+      setVideos(oldVideos);
+      alert("Failed to delete post: " + err.message);
+    }
+  }, [videos]);
+
+  // 3. Save Post Callback
+  const handleSavePostToggle = useCallback((video: Video) => {
+    let saved = [...savedVideoIds];
+    const isSaved = saved.includes(video.id);
+    
+    if (isSaved) {
+      saved = saved.filter(id => id !== video.id);
+      alert("Removed from Saved posts!");
+    } else {
+      saved.push(video.id);
+      alert("Saved to your profile!");
+    }
+    
+    setSavedVideoIds(saved);
+    localStorage.setItem('vibestream_saved_posts', JSON.stringify(saved));
+    setActiveMenuVideo(null);
+  }, [savedVideoIds]);
+
+  // 4. Not Interested Callback
+  const handleNotInterested = useCallback((video: Video) => {
+    const hidden = [...hiddenVideoIds, video.id];
+    setHiddenVideoIds(hidden);
+    setActiveMenuVideo(null);
+    alert("We will hide this post and show you less of this.");
+  }, [hiddenVideoIds]);
+
+  // 5. Report Post Callback
+  const handleReportPost = useCallback(async (video: Video, reason: string) => {
+    const reported = [...reportedVideoIds, video.id];
+    setReportedVideoIds(reported);
+    localStorage.setItem('vibestream_reported_posts', JSON.stringify(reported));
+    setActiveMenuVideo(null);
+
+    // Try optional table insert, fallback gracefully
+    try {
+      await supabase.from('reports').insert({
+        video_id: video.id,
+        user_id: profile.id || null,
+        reason: reason
+      });
+    } catch (err) {
+      // ignore
+    }
+
+    alert(`Thank you! Post reported for: "${reason}". We have hidden this post from your feed.`);
+  }, [reportedVideoIds, profile.id]);
+
+  // 6. Copy Link Callback
+  const handleCopyLink = useCallback((video: Video) => {
+    try {
+      navigator.clipboard.writeText(video.url);
+      setToast({ show: true, text: "Link copied to clipboard!", avatar: video.user.avatar });
+      setTimeout(() => setToast(null), 2500);
+    } catch (err) {
+      alert("Failed to copy link.");
+    }
+    setActiveMenuVideo(null);
+  }, []);
+
+  // 7. Share Post Callback
+  const handleSharePost = useCallback((video: Video) => {
+    if (navigator.share) {
+      navigator.share({
+        title: `@${video.user.name}'s Vibe`,
+        text: video.description,
+        url: video.url
+      }).catch(() => {});
+    } else {
+      handleCopyLink(video);
+    }
+    setActiveMenuVideo(null);
+  }, [handleCopyLink]);
 
   useEffect(() => {
     activeChatRef.current = activeChat;
   }, [activeChat]);
+
+  useEffect(() => {
+    authenticatedRef.current = authenticated;
+  }, [authenticated]);
+
+  useEffect(() => {
+    profileRef.current = profile;
+  }, [profile]);
+
+  useEffect(() => {
+    if (activeMenuVideo || isEditingPost) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = '';
+    }
+    return () => {
+      document.body.style.overflow = '';
+    };
+  }, [activeMenuVideo, isEditingPost]);
 
   const [isLightMode, setIsLightMode] = useState(() => {
     return localStorage.getItem('vibechatTheme') === 'light';
@@ -349,12 +533,14 @@ export default function App() {
 
     socketRef.current.on('connect', () => {
       console.log('Connected to socket server');
-      // Auto-authenticate socket if profile has an ID
+      // Re-authenticate on every connect/reconnect to rejoin personal room
+      // Use localStorage as source of truth since this closure may have stale state
       const savedProfile = localStorage.getItem('vibechatProfile');
       if (savedProfile) {
         const parsed = JSON.parse(savedProfile);
         if (parsed?.id && parsed.handle !== GUEST_PROFILE.handle) {
           socketRef.current?.emit('authenticate', parsed.id);
+          console.log('Socket re-authenticated for user:', parsed.id);
         }
       }
     });
@@ -423,30 +609,38 @@ export default function App() {
 
   useEffect(() => {
     async function fetchVideos() {
-      const { data, error } = await supabase
-        .from('videos')
-        .select(`
-          *,
-          users:user_id ( username, avatar_url )
-        `)
-        .order('created_at', { ascending: false });
+      setIsLoadingVideos(true);
+      try {
+        const { data, error } = await supabase
+          .from('videos')
+          .select(`
+            *,
+            users:user_id ( username, avatar_url )
+          `)
+          .order('created_at', { ascending: false });
 
-      if (data && data.length > 0) {
-        const formattedVideos = data.map((v: any) => ({
-          id: v.id,
-          url: v.url,
-          user_id: v.user_id,
-          user: { name: v.users?.username || 'user', avatar: v.users?.avatar_url || 'https://api.dicebear.com/7.x/avataaars/svg?seed=user' },
-          description: v.description || '',
-          likes: v.likes || 0,
-          comments: v.comments || 0,
-          shares: v.shares || 0
-        }));
-        setVideos(formattedVideos);
+        if (data) {
+          const formattedVideos = data.map((v: any) => ({
+            id: v.id,
+            url: v.url,
+            user_id: v.user_id,
+            user: { name: v.users?.username || 'user', avatar: v.users?.avatar_url || 'https://api.dicebear.com/7.x/avataaars/svg?seed=user' },
+            description: v.description || '',
+            likes: v.likes || 0,
+            comments: v.comments || 0,
+            shares: v.shares || 0
+          }));
+          setVideos(formattedVideos);
+          videosLoadedRef.current = true;
+        }
+      } catch (err) {
+        console.error("Error fetching videos:", err);
+      } finally {
+        setIsLoadingVideos(false);
       }
     }
     
-    if (currentView === 'home') {
+    if (currentView === 'home' && !videosLoadedRef.current) {
       fetchVideos();
     }
   }, [currentView]);
@@ -468,25 +662,27 @@ export default function App() {
       if (!socketRef.current) return;
       
       const handleGlobalMessage = (data: Message) => {
-        // Only show toast if chat isn't currently open AND message is from someone else
-        if (data.senderId !== profile.id) {
-          if (activeChatRef.current?.room !== data.conversationId) {
-            setToast({ show: true, text: `${data.senderName}: ${data.text}`, avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + data.senderName });
-            setTimeout(() => setToast(null), 3000);
-            
-            // Auto-mark as delivered since user is online
-            supabase.from('messages').update({ status: 'delivered' }).eq('id', data.id).then();
-            socketRef.current?.emit('message-status-update', { room: data.conversationId, messageId: data.id, status: 'delivered', senderId: data.senderId });
-          }
+        // Bug 1 fix: Debounced refresh instead of hammering DB on every event
+        debouncedFetchConversations();
+
+        // Bug 11 fix: Use refs for stable state access in socket handlers
+        // Skip toast and delivered-marking for our own messages
+        if (data.senderId === profileRef.current.id) return;
+
+        // Show toast only if the chat with this conversation isn't currently open
+        if (activeChatRef.current?.room !== data.conversationId) {
+          setToast({ show: true, text: `${data.senderName}: ${data.text}`, avatar: 'https://api.dicebear.com/7.x/avataaars/svg?seed=' + data.senderName });
+          setTimeout(() => setToast(null), 3000);
+          
+          // Auto-mark as delivered since user is online
+          supabase.from('messages').update({ status: 'delivered' }).eq('id', data.id).then();
+          socketRef.current?.emit('message-status-update', { room: data.conversationId, messageId: data.id, status: 'delivered', senderId: data.senderId });
         }
-        
-        // Fetch fresh conversations to update sidebar in real-time!
-        fetchConversations();
       };
 
       const handleGlobalStatus = (data: any) => {
-        // Fetch fresh conversations to update read status and counts in real-time!
-        fetchConversations();
+        // Bug 1 fix: Debounced refresh
+        debouncedFetchConversations();
       };
       
       socketRef.current.on('global-new-message', handleGlobalMessage);
@@ -499,31 +695,34 @@ export default function App() {
     }
   }, [authenticated, profile.id]);
 
-  const fetchConversations = async () => {
-    if (authenticated && profile.id) {
+  const fetchConversations = useCallback(async () => {
+    // Bug 11 fix: Use refs for stable state access
+    const currentAuth = authenticatedRef.current;
+    const currentProfile = profileRef.current;
+    if (currentAuth && currentProfile.id) {
       // 1. Mark unread messages as delivered if we are online
       supabase.from('messages')
         .update({ status: 'delivered' })
-        .eq('receiver_id', profile.id)
+        .eq('receiver_id', currentProfile.id)
         .eq('status', 'sent')
         .then();
 
       // Get unread conversations count
       const { data: unreadData } = await supabase.from('messages')
         .select('conversation_id')
-        .eq('receiver_id', profile.id)
+        .eq('receiver_id', currentProfile.id)
         .neq('status', 'seen');
       const unreadConvoIds = new Set(unreadData?.map(m => m.conversation_id) || []);
 
       // 2. Fetch conversations
       const { data, error } = await supabase.from('conversations')
         .select('*, p1:users!participant1_id(id, username, avatar_url), p2:users!participant2_id(id, username, avatar_url)')
-        .or(`participant1_id.eq.${profile.id},participant2_id.eq.${profile.id}`)
+        .or(`participant1_id.eq.${currentProfile.id},participant2_id.eq.${currentProfile.id}`)
         .order('last_message_timestamp', { ascending: false });
         
       if (!error && data) {
         const convos = data.map((c: any) => {
-          const otherUser = c.participant1_id === profile.id ? c.p2 : c.p1;
+          const otherUser = c.participant1_id === currentProfile.id ? c.p2 : c.p1;
           return {
             id: c.id,
             room: c.id,
@@ -536,7 +735,15 @@ export default function App() {
         setConversations(convos);
       }
     }
-  };
+  }, []);
+
+  // Bug 1 fix: Debounced version — prevents hammering DB with 30+ queries on rapid messages
+  const debouncedFetchConversations = useCallback(() => {
+    if (fetchConvoTimerRef.current) clearTimeout(fetchConvoTimerRef.current);
+    fetchConvoTimerRef.current = setTimeout(() => {
+      fetchConversations();
+    }, 500);
+  }, [fetchConversations]);
 
   useEffect(() => {
     if (currentView === 'chat') {
@@ -603,10 +810,27 @@ export default function App() {
               exit={{ opacity: 0, scale: 1.02 }}
               className="md:col-span-12 h-full min-h-0 w-[calc(100%+2rem)] -mx-4 md:mx-auto md:w-full md:max-w-[420px] rounded-none md:rounded-3xl border-none md:border border-gray-800 overflow-hidden relative shadow-2xl shadow-indigo-vibe/5 bg-black"
             >
-              <div className="h-full overflow-y-scroll snap-y-mandatory no-scrollbar">
-                {videos.map((video) => (
-                  <VideoPlayer key={video.id} video={video} onOpenComments={setActiveCommentVideo} onShare={setActiveShareVideo} />
-                ))}
+              <div className="h-full overflow-y-scroll snap-y-mandatory no-scrollbar gpu-scroll">
+                {isLoadingVideos ? (
+                  [1, 2, 3].map((i) => <VideoSkeleton key={i} />)
+                ) : visibleVideos.length === 0 ? (
+                  <div className="h-full flex flex-col items-center justify-center text-center p-8 bg-neutral-950">
+                    <EyeOff className="w-12 h-12 text-gray-600 mb-4 animate-pulse" />
+                    <h3 className="text-lg font-black tracking-tight">No Vibes Yet</h3>
+                    <p className="text-gray-500 text-xs mt-2 max-w-xs leading-relaxed">Click Upload at the bottom to share your very first vibe with the community!</p>
+                  </div>
+                ) : (
+                  visibleVideos.map((video) => (
+                    <VideoPlayer 
+                      key={video.id} 
+                      video={video} 
+                      onOpenComments={setActiveCommentVideo} 
+                      onShare={setActiveShareVideo} 
+                      onLike={handleLikeUpdate}
+                      onOpenMenu={setActiveMenuVideo}
+                    />
+                  ))
+                )}
               </div>
             </motion.div>
           )}
@@ -646,6 +870,13 @@ export default function App() {
                       onClick={() => {
                         // Optimistically mark as read locally
                         setConversations(prev => prev.map(c => c.id === chat.id ? { ...c, unread: false } : c));
+                        // Also mark in DB so fetchConversations won't re-mark as unread
+                        supabase.from('messages')
+                          .update({ status: 'delivered' })
+                          .eq('conversation_id', chat.id)
+                          .eq('receiver_id', profile.id)
+                          .eq('status', 'sent')
+                          .then();
                         setActiveChat({ room: chat.room, user: chat.user });
                       }}
                     >
@@ -703,14 +934,17 @@ export default function App() {
 
           {currentView === 'discover' && (
             <div className="md:col-span-12 h-full min-h-0">
-              <DiscoverView />
+              <DiscoverView videos={videos} />
             </div>
           )}
 
           {currentView === 'upload' && (
             <div className="md:col-span-12 h-full min-h-0">
               {authenticated ? (
-                <UploadView profile={profile} onUploadComplete={() => setCurrentView('home')} />
+                <UploadView profile={profile} onUploadComplete={() => {
+                  videosLoadedRef.current = false;
+                  setCurrentView('home');
+                }} />
               ) : (
                 <div className="h-full bento-card p-8 flex flex-col items-center justify-center text-center">
                   <h2 className="text-2xl font-black tracking-tight mb-4">Login Required</h2>
@@ -802,6 +1036,7 @@ export default function App() {
             onClose={() => setActiveShareVideo(null)}
             profile={profile}
             conversations={conversations}
+            socket={socketRef.current}
           />
         )}
       </AnimatePresence>
@@ -944,11 +1179,155 @@ export default function App() {
         )}
       </AnimatePresence>
 
+      {/* 1. Global Instagram-style Option Menu */}
+      <AnimatePresence>
+        {activeMenuVideo && (
+          <div className="fixed inset-0 z-[300] flex items-end md:items-center justify-center">
+            {/* Backdrop with click-outside listener */}
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setActiveMenuVideo(null)}
+              className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+            />
+            
+            {/* Instagram Style Sheet */}
+            <motion.div
+              initial={{ y: '100%', opacity: 0.5 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: '100%', opacity: 0.5 }}
+              transition={{ type: 'spring', damping: 25, stiffness: 350 }}
+              className="relative bg-bg-card border-t md:border border-gray-800 rounded-t-3xl md:rounded-3xl w-full md:max-w-sm overflow-hidden flex flex-col z-10 shadow-2xl pb-6 md:pb-0"
+            >
+              {/* Mobile handle indicator */}
+              <div className="flex justify-center p-3 cursor-pointer md:hidden" onClick={() => setActiveMenuVideo(null)}>
+                <div className="w-12 h-1 bg-gray-700 rounded-full" />
+              </div>
+
+              {/* Ownership-based Option Menu Options */}
+              <div className="flex flex-col text-center divide-y divide-gray-850 text-sm">
+                {authenticated && activeMenuVideo.user_id === profile.id ? (
+                  <>
+                    <button 
+                      onClick={() => {
+                        setEditCaptionText(activeMenuVideo.description);
+                        setIsEditingPost(activeMenuVideo);
+                        setActiveMenuVideo(null);
+                      }}
+                      className="py-4 hover:bg-white/5 transition-colors font-bold text-white flex items-center justify-center gap-2 cursor-pointer border-none bg-transparent outline-none"
+                    >
+                      <Edit3 className="w-4 h-4 text-indigo-vibe-light" /> Edit Post
+                    </button>
+                    <button 
+                      onClick={() => handleDeletePost(activeMenuVideo)}
+                      className="py-4 hover:bg-white/5 transition-colors font-bold text-red-500 flex items-center justify-center gap-2 cursor-pointer border-none bg-transparent outline-none"
+                    >
+                      <Trash2 className="w-4 h-4 text-red-500" /> Delete Post
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button 
+                      onClick={() => handleSavePostToggle(activeMenuVideo)}
+                      className="py-4 hover:bg-white/5 transition-colors font-bold text-white flex items-center justify-center gap-2 cursor-pointer border-none bg-transparent outline-none"
+                    >
+                      <Bookmark className={`w-4 h-4 ${savedVideoIds.includes(activeMenuVideo.id) ? 'fill-coral text-coral' : 'text-gray-400'}`} />
+                      {savedVideoIds.includes(activeMenuVideo.id) ? 'Unsave Post' : 'Save Post'}
+                    </button>
+                    <button 
+                      onClick={() => handleNotInterested(activeMenuVideo)}
+                      className="py-4 hover:bg-white/5 transition-colors font-bold text-orange flex items-center justify-center gap-2 cursor-pointer border-none bg-transparent outline-none"
+                    >
+                      <EyeOff className="w-4 h-4 text-orange" /> Not Interested
+                    </button>
+                    <button 
+                      onClick={() => {
+                        const reason = window.prompt("Reason for reporting (e.g. Spam, Inappropriate, Harassment):");
+                        if (reason && reason.trim()) {
+                          handleReportPost(activeMenuVideo, reason.trim());
+                        }
+                      }}
+                      className="py-4 hover:bg-white/5 transition-colors font-bold text-red-400 flex items-center justify-center gap-2 cursor-pointer border-none bg-transparent outline-none"
+                    >
+                      <AlertTriangle className="w-4 h-4 text-red-400" /> Report Post
+                    </button>
+                  </>
+                )}
+                
+                <button 
+                  onClick={() => handleSharePost(activeMenuVideo)}
+                  className="py-4 hover:bg-white/5 transition-colors font-bold text-white flex items-center justify-center gap-2 cursor-pointer border-none bg-transparent outline-none"
+                >
+                  <Share2 className="w-4 h-4 text-white" /> Share Vibe
+                </button>
+                <button 
+                  onClick={() => handleCopyLink(activeMenuVideo)}
+                  className="py-4 hover:bg-white/5 transition-colors font-bold text-white flex items-center justify-center gap-2 cursor-pointer border-none bg-transparent outline-none"
+                >
+                  <Copy className="w-4 h-4 text-white" /> Copy Link
+                </button>
+                <button 
+                  onClick={() => setActiveMenuVideo(null)}
+                  className="py-4 hover:bg-white/5 transition-colors font-black text-gray-400 cursor-pointer border-none bg-transparent outline-none"
+                >
+                  Cancel
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* 2. Global Caption Edit Modal */}
+      <AnimatePresence>
+        {isEditingPost && (
+          <div className="fixed inset-0 z-[310] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsEditingPost(null)}
+              className="absolute inset-0 bg-black/75 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              exit={{ scale: 0.95, opacity: 0 }}
+              className="relative bg-bg-card border border-gray-800 rounded-3xl w-full max-w-md p-6 z-10 shadow-2xl"
+            >
+              <h2 className="text-xl font-black mb-4">Edit Caption</h2>
+              <textarea
+                value={editCaptionText}
+                onChange={(e) => setEditCaptionText(e.target.value)}
+                placeholder="Write a caption..."
+                className="w-full bg-bg-alt border border-gray-800 rounded-2xl px-5 py-4 text-sm text-white outline-none focus:border-coral transition-colors resize-none mb-6"
+                rows={4}
+              />
+              <div className="flex gap-4">
+                <button
+                  onClick={() => setIsEditingPost(null)}
+                  className="flex-1 border border-gray-800 hover:border-gray-700 py-4 rounded-[2rem] font-black text-[10px] uppercase tracking-widest text-gray-300 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleEditPostSave}
+                  className="flex-1 coral-orange-gradient text-white py-4 rounded-[2rem] font-black text-[10px] uppercase tracking-widest shadow-lg shadow-orange-500/10 cursor-pointer"
+                >
+                  Save Vibe
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
     </div>
   );
 }
 
-function DiscoverView() {
+function DiscoverView({ videos }: { videos: Video[] }) {
   const [activeFilter, setActiveFilter] = useState('none');
 
   return (
@@ -995,7 +1374,7 @@ function DiscoverView() {
         {/* Video Grid */}
         <div className="md:col-span-8 md:row-span-6 bento-card p-6 overflow-y-auto no-scrollbar">
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-            {MOCK_VIDEOS.map((v) => (
+            {videos.map((v) => (
               <motion.div
                 key={v.id}
                 whileHover={{ scale: 1.02 }}
@@ -1039,6 +1418,8 @@ function DiscoverView() {
 }
 
 function ProfileView({ profile, authenticated, videos, onLogout, onVideoClick, onEdit }: { profile: Profile; authenticated: boolean; videos: any[]; onLogout: () => void; onVideoClick: (id: string) => void; onEdit: () => void }) {
+  const [subView, setSubView] = useState<'posts' | 'liked' | 'saved'>('posts');
+
   if (!authenticated) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-center p-8">
@@ -1054,6 +1435,25 @@ function ProfileView({ profile, authenticated, videos, onLogout, onVideoClick, o
     (v) => v.user_id === profile.id || v.user?.name === profile.handle
   );
 
+  const likedVibes = videos.filter((v) => {
+    try {
+      const likedIds = JSON.parse(localStorage.getItem('vibestream_liked_videos') || '[]');
+      return likedIds.includes(v.id);
+    } catch {
+      return false;
+    }
+  });
+
+  const savedVibes = videos.filter((v) => {
+    try {
+      const savedIds = JSON.parse(localStorage.getItem('vibestream_saved_posts') || '[]');
+      return savedIds.includes(v.id);
+    } catch {
+      return false;
+    }
+  });
+
+  const displayVibes = subView === 'posts' ? myVibes : subView === 'liked' ? likedVibes : savedVibes;
   const totalLikes = myVibes.reduce((sum, v) => sum + (v.likes || 0), 0);
 
   return (
@@ -1119,17 +1519,32 @@ function ProfileView({ profile, authenticated, videos, onLogout, onVideoClick, o
         {/* Content Feed Grid */}
         <div className="md:col-span-8 bento-card p-8 h-fit">
           <div className="flex items-center gap-8 mb-8 pb-4 border-b border-gray-800/50 text-xs font-black uppercase tracking-[0.2em]">
-            <span className="text-white border-b-2 border-coral pb-4">My Vibes</span>
-            <span className="text-gray-500 hover:text-white transition-colors cursor-pointer pb-4">Liked</span>
-            <span className="text-gray-500 hover:text-white transition-colors cursor-pointer pb-4">Saved</span>
+            <span 
+              onClick={() => setSubView('posts')}
+              className={`cursor-pointer pb-4 transition-colors ${subView === 'posts' ? 'text-white border-b-2 border-coral' : 'text-gray-500 hover:text-white'}`}
+            >
+              My Vibes
+            </span>
+            <span 
+              onClick={() => setSubView('liked')}
+              className={`cursor-pointer pb-4 transition-colors ${subView === 'liked' ? 'text-white border-b-2 border-coral' : 'text-gray-500 hover:text-white'}`}
+            >
+              Liked
+            </span>
+            <span 
+              onClick={() => setSubView('saved')}
+              className={`cursor-pointer pb-4 transition-colors ${subView === 'saved' ? 'text-white border-b-2 border-coral' : 'text-gray-500 hover:text-white'}`}
+            >
+              Saved
+            </span>
           </div>
           <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-            {myVibes.length === 0 ? (
+            {displayVibes.length === 0 ? (
               <div className="col-span-full py-16 text-center text-gray-500 font-bold uppercase tracking-widest text-[10px] border-2 border-dashed border-gray-800/50 rounded-3xl">
-                No vibes uploaded yet.
+                {subView === 'posts' ? 'No vibes uploaded yet.' : subView === 'liked' ? 'No liked vibes yet.' : 'No saved vibes yet.'}
               </div>
             ) : (
-              myVibes.map((v) => (
+              displayVibes.map((v) => (
                 <div
                   key={v.id}
                   onClick={() => onVideoClick(v.id)}
@@ -1285,7 +1700,8 @@ function UploadView({ profile, onUploadComplete }: { profile: Profile, onUploadC
   );
 }
 
-function NavButton({ icon: Icon, active, onClick }: { icon: any, label: string, active: boolean, onClick: () => void }) {
+// Bug 2 fix: Memoize NavButton to prevent re-render on every parent state change
+const NavButton = React.memo(function NavButton({ icon: Icon, active, onClick }: { icon: any, label: string, active: boolean, onClick: () => void }) {
   return (
     <button
       onClick={onClick}
@@ -1300,10 +1716,62 @@ function NavButton({ icon: Icon, active, onClick }: { icon: any, label: string, 
       )}
     </button>
   );
-}
+});
 
-function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenComments?: (video: Video) => void; onShare?: (video: Video) => void; key?: React.Key }) {
-  const [liked, setLiked] = useState(false);
+// Pulsing loading skeleton matching the VideoPlayer layout
+const VideoSkeleton = () => (
+  <div className="w-full h-full snap-start relative bg-black flex items-center justify-center animate-pulse">
+    <div className="absolute inset-0 bg-neutral-950" />
+    
+    {/* Left Info Skeleton */}
+    <div className="absolute left-4 bottom-6 md:left-6 md:bottom-8 w-2/3 space-y-4 z-20">
+      <div className="flex items-center gap-3">
+        <div className="w-9 h-9 rounded-full bg-neutral-800" />
+        <div className="flex flex-col gap-1.5">
+          <div className="w-24 h-3.5 rounded bg-neutral-800" />
+          <div className="w-16 h-2 rounded bg-neutral-800" />
+        </div>
+      </div>
+      <div className="w-full h-3 rounded bg-neutral-800" />
+      <div className="w-4/5 h-3 rounded bg-neutral-800" />
+      <div className="w-32 h-6 rounded-full bg-neutral-800" />
+    </div>
+
+    {/* Right Sidebar Skeleton */}
+    <div className="absolute right-4 bottom-6 md:right-6 md:bottom-10 flex flex-col items-center gap-6 z-20">
+      {[1, 2, 3, 4].map((i) => (
+        <div key={i} className="flex flex-col items-center gap-1.5">
+          <div className="w-8 h-8 rounded-full bg-neutral-800" />
+          <div className="w-6 h-2 rounded bg-neutral-850" />
+        </div>
+      ))}
+    </div>
+  </div>
+);
+
+// Bug 2 fix: Memoize VideoPlayer to prevent re-render when parent state changes (toast, chat, etc.)
+const VideoPlayer = React.memo(function VideoPlayer({ 
+  video, 
+  onOpenComments, 
+  onShare, 
+  onLike, 
+  onOpenMenu 
+}: { 
+  video: Video; 
+  onOpenComments?: (video: Video) => void; 
+  onShare?: (video: Video) => void; 
+  onLike?: (id: string, increment: number) => void;
+  onOpenMenu?: (video: Video) => void;
+  key?: React.Key 
+}) {
+  const [liked, setLiked] = useState(() => {
+    try {
+      const likedIds = JSON.parse(localStorage.getItem('vibestream_liked_videos') || '[]');
+      return likedIds.includes(video.id);
+    } catch {
+      return false;
+    }
+  });
   const [isMuted, setIsMuted] = useState(true);
   const [showMuteIndicator, setShowMuteIndicator] = useState(false);
   const [isActive, setIsActive] = useState(false);
@@ -1355,10 +1823,40 @@ function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenC
   const handleLike = async () => {
     const newLiked = !liked;
     setLiked(newLiked);
+    onLike?.(video.id, newLiked ? 1 : -1);
+
+    try {
+      const likedIds = JSON.parse(localStorage.getItem('vibestream_liked_videos') || '[]');
+      if (newLiked) {
+        if (!likedIds.includes(video.id)) likedIds.push(video.id);
+      } else {
+        const idx = likedIds.indexOf(video.id);
+        if (idx > -1) likedIds.splice(idx, 1);
+      }
+      localStorage.setItem('vibestream_liked_videos', JSON.stringify(likedIds));
+    } catch (err) {
+      console.error("Failed to update liked local storage:", err);
+    }
+
     try {
       await supabase.rpc('update_likes', { p_video_id: video.id, p_increment: newLiked ? 1 : -1 });
     } catch (err) {
       console.error("Failed to update likes:", err);
+      // rollback
+      setLiked(!newLiked);
+      onLike?.(video.id, newLiked ? -1 : 1);
+      try {
+        const likedIds = JSON.parse(localStorage.getItem('vibestream_liked_videos') || '[]');
+        if (!newLiked) {
+          if (!likedIds.includes(video.id)) likedIds.push(video.id);
+        } else {
+          const idx = likedIds.indexOf(video.id);
+          if (idx > -1) likedIds.splice(idx, 1);
+        }
+        localStorage.setItem('vibestream_liked_videos', JSON.stringify(likedIds));
+      } catch (localErr) {
+        console.error(localErr);
+      }
     }
   };
 
@@ -1389,6 +1887,18 @@ function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenC
       id={`video-${video.id}`}
       className="h-full w-full snap-start relative bg-black overflow-hidden flex items-center justify-center"
     >
+      {/* Instagram-style Three-Dot Menu Button in top-right */}
+      <div className="absolute top-4 right-4 z-30">
+        <button 
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpenMenu?.(video);
+          }}
+          className="w-10 h-10 rounded-full bg-black/40 border border-white/10 flex items-center justify-center text-white hover:bg-black/60 active:scale-95 transition-all drop-shadow-[0_2px_8px_rgba(0,0,0,0.5)] cursor-pointer"
+        >
+          <MoreVertical className="w-5 h-5" />
+        </button>
+      </div>
       {/* Blurred Background Layer for Option B (Landscape Support) */}
       {isImage ? (
         <img src={video.url} className="absolute inset-0 h-full w-full object-cover blur-3xl opacity-40 scale-110" alt="" />
@@ -1507,9 +2017,10 @@ function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenC
           <span className="text-[10px] md:text-[11px] font-black tracking-wider text-white drop-shadow-[0_1.5px_4px_rgba(0,0,0,0.7)] mt-0.5">Share</span>
         </div>
 
+        {/* Bug 5 fix: Only animate music icon when video is active/in viewport */}
         <motion.div
-          animate={{ rotate: 360 }}
-          transition={{ duration: 4, repeat: Infinity, ease: 'linear' }}
+          animate={isActive ? { rotate: 360 } : { rotate: 0 }}
+          transition={isActive ? { duration: 4, repeat: Infinity, ease: 'linear' } : { duration: 0 }}
           className="w-7.5 h-7.5 md:w-9 md:h-9 rounded-full p-1.5 bg-black/40 border border-white/20 shadow-lg shadow-black/50 overflow-hidden flex items-center justify-center drop-shadow-[0_2px_6px_rgba(0,0,0,0.6)] mt-1"
         >
           <Music2 className="w-full h-full text-white" />
@@ -1546,13 +2057,14 @@ function VideoPlayer({ video, onOpenComments, onShare }: { video: Video; onOpenC
       </div>
     </div>
   );
-}
+});
 
 function ChatWindow({ conversationId, user, profile, onClose, socket }: { conversationId: string, user: any, profile: Profile, onClose: () => void, socket: Socket }) {
   const [inputText, setInputText] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [isConnected, setIsConnected] = useState(socket.connected);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const prevMsgCountRef = useRef(0);
 
   useEffect(() => {
     const handleConnect = () => setIsConnected(true);
@@ -1569,24 +2081,30 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
 
   useEffect(() => {
     // Fetch historical messages from Supabase
+    // Bug 9 fix: Limit to last 100 messages for performance
     const fetchHistory = async () => {
       const { data, error } = await supabase
         .from('messages')
         .select('*')
         .eq('conversation_id', conversationId)
-        .order('created_at', { ascending: true });
+        .order('created_at', { ascending: false })
+        .limit(100);
       if (!error && data) {
-        setMessages(data.map(m => ({
+        // Reverse to display oldest first after limiting
+        const reversed = data.reverse();
+        const mapped = reversed.map(m => ({
           id: m.id,
           senderId: m.sender_id,
-          senderName: m.sender_id === profile.id ? 'me' : user.name,
-          text: m.text,
+          senderName: m.sender_id === profile.id ? 'me' : (user.name || user.username || 'User'),
+          text: m.content,
           timestamp: new Date(m.created_at).getTime(),
           status: m.status,
           conversationId: m.conversation_id
-        })));
+        }));
+        prevMsgCountRef.current = mapped.length;
+        setMessages(mapped);
 
-        const unreadIds = data.filter((m: any) => m.receiver_id === profile.id && m.status !== 'seen').map((m: any) => m.id);
+        const unreadIds = reversed.filter((m: any) => m.receiver_id === profile.id && m.status !== 'seen').map((m: any) => m.id);
         if (unreadIds.length > 0) {
           await supabase.from('messages').update({ status: 'seen' }).in('id', unreadIds);
           unreadIds.forEach((id: string) => {
@@ -1605,30 +2123,24 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
     socket.on('connect', joinRoom);
 
     const handleNewMessage = (data: Message) => {
-      // If we are the sender, we already have this message (inserted optimistically with UUID)
-      if (data.senderId === profile.id) {
-        setMessages(prev => {
-          const hasReal = prev.some(m => m.id === data.id);
-          if (hasReal) return prev;
-          
-          // Match any optimistic message by matching text content within 15 seconds
-          const optIndex = prev.findIndex(m => m.senderId === profile.id && m.text === data.text && Math.abs(m.timestamp - data.timestamp) < 15000);
-          if (optIndex !== -1) {
-            return prev.map((m, idx) => idx === optIndex ? data : m);
-          }
-          return [...prev, data];
-        });
-        return;
-      }
-
+      // Since server uses socket.to() (excludes sender), we only receive OTHER people's messages here.
+      // Simple dedup by ID to prevent any edge-case duplicates.
       setMessages(prev => {
         if (prev.find(m => m.id === data.id)) return prev;
         return [...prev, data];
       });
 
-      // Auto-mark as seen and notify sender
-      supabase.from('messages').update({ status: 'seen' }).eq('id', data.id).then();
-      socket.emit('message-status-update', { room: conversationId, messageId: data.id, status: 'seen', senderId: data.senderId });
+      // Auto-mark as seen with retry — the sender's DB write may not have completed yet
+      const markSeen = async (retries = 3) => {
+        const { error } = await supabase.from('messages').update({ status: 'seen' }).eq('id', data.id);
+        if (error && retries > 0) {
+          // Message may not exist in DB yet; retry after a short delay
+          setTimeout(() => markSeen(retries - 1), 500);
+        } else {
+          socket.emit('message-status-update', { room: conversationId, messageId: data.id, status: 'seen', senderId: data.senderId });
+        }
+      };
+      markSeen();
     };
 
     const handleStatusUpdated = ({ messageId, status }: { messageId: string, status: 'sent' | 'delivered' | 'seen' }) => {
@@ -1647,7 +2159,12 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
 
   useEffect(() => {
     if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      const el = scrollRef.current;
+      const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+      // Only auto-scroll if user is near the bottom (reading latest messages)
+      if (isNearBottom) {
+        el.scrollTop = el.scrollHeight;
+      }
     }
   }, [messages]);
 
@@ -1679,22 +2196,26 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
       conversation_id: conversationId,
       sender_id: profile.id,
       receiver_id: user.id,
-      text: text,
+      content: text,
       status: 'sent'
     });
 
-    // Update conversation timestamp
+    if (error) {
+      // ROLLBACK: Remove the optimistic message and restore input
+      console.error("Error inserting message:", error);
+      setMessages(prev => prev.filter(m => m.id !== messageId));
+      setInputText(text);
+      return;
+    }
+
+    // Update conversation timestamp (only on success)
     await supabase.from('conversations').update({ 
       last_message_text: text, 
       last_message_timestamp: new Date().toISOString() 
     }).eq('id', conversationId);
 
-    if (!error) {
-      // Emit via socket with the room identifier
-      socket.emit('send-message', { ...newMessage, room: conversationId });
-    } else {
-      console.error("Error inserting message:", error);
-    }
+    // Emit via socket with the room identifier
+    socket.emit('send-message', { ...newMessage, room: conversationId });
   };
 
   return (
@@ -1727,9 +2248,9 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
             <p className="font-black text-center uppercase tracking-[0.4em] text-xs">Vibe Encrypted</p>
           </div>
         )}
-        {messages.map((msg) => (
+        {messages.map((msg, index) => (
           <motion.div
-            initial={{ scale: 0.9, opacity: 0, x: msg.senderId === profile.id ? 20 : -20 }}
+            initial={index >= prevMsgCountRef.current ? { scale: 0.9, opacity: 0, x: msg.senderId === profile.id ? 20 : -20 } : false}
             animate={{ scale: 1, opacity: 1, x: 0 }}
             key={msg.id}
             className={`flex ${msg.senderId === profile.id ? 'justify-end' : 'justify-start'}`}
@@ -1756,7 +2277,7 @@ function ChatWindow({ conversationId, user, profile, onClose, socket }: { conver
           onChange={(e) => setInputText(e.target.value)}
           placeholder="Transmit a vibe..."
           className="flex-1 bg-bg-alt border border-gray-800 rounded-2xl px-6 py-4 outline-none focus:border-coral transition-all font-bold text-xs uppercase tracking-widest"
-          onKeyPress={(e) => e.key === 'Enter' && handleSend()}
+          onKeyDown={(e) => e.key === 'Enter' && handleSend()}
         />
         <motion.button
           whileHover={{ scale: 1.05 }}

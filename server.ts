@@ -47,14 +47,14 @@ async function startServer() {
 
     socket.on("send-message", (data) => {
       // data: { room, senderId, receiverId, senderName, text, timestamp, status, id, conversationId }
-      // Emit to the specific conversation room (for anyone who has the chat window open)
-      io.to(data.room).emit("new-message", data);
+      // Emit to the specific conversation room EXCLUDING the sender (they already have it via optimistic UI)
+      socket.to(data.room).emit("new-message", data);
       
       // Also emit to the receiver's personal room for global sidebar updates / toast notifications
       if (data.receiverId) {
         io.to(`user-${data.receiverId}`).emit("global-new-message", data);
       }
-      // Also emit to the sender's personal room so their sidebar updates in real-time
+      // Emit to the sender's personal room for sidebar updates only (NOT as a chat message)
       if (data.senderId) {
         io.to(`user-${data.senderId}`).emit("global-new-message", data);
       }
@@ -89,7 +89,8 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
+    const distPath = path.join(__dirname, "dist");
+    console.log("Serving static files from:", distPath);
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
